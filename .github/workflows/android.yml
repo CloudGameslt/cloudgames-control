@@ -1,0 +1,63 @@
+name: Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: android
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CG_URL: ${{ secrets.CG_URL }}
+      CG_TOKEN: ${{ secrets.CG_RELEASE_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patikrinti nustatymus
+        run: |
+          [ -n "$CG_URL" ] && [ -n "$CG_TOKEN" ] || { echo "Repozitorijos Settings → Secrets → Actions trūksta CG_URL arba CG_RELEASE_TOKEN"; exit 1; }
+          code=$(curl -s -o /dev/null -w "%{http_code}" -H "X-Release-Token: $CG_TOKEN" "$CG_URL/api/app/ci/ping")
+          [ "$code" = "200" ] || { echo "Svetainė atmetė raktą (HTTP $code). Patikrink CG_RELEASE_TOKEN ir APP_RELEASE_TOKEN serverio .env faile."; exit 1; }
+          [ -f pubspec.yaml ] || { echo "pubspec.yaml turi būti repozitorijos šaknyje (ne aplanke mobile/)"; exit 1; }
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Paruošti projektą
+        run: bash tool/prepare.sh
+
+      - name: Kompiliuoti
+        run: |
+          VER=$(grep -E '^version:' pubspec.yaml | sed -E 's/^version:[[:space:]]*([0-9.]+).*/\1/')
+          BUILD=$((1000 + GITHUB_RUN_NUMBER))
+          echo "VER=$VER" >> "$GITHUB_ENV"; echo "BUILD=$BUILD" >> "$GITHUB_ENV"
+          flutter build apk --release --build-name "$VER" --build-number "$BUILD" --dart-define=BUILD="$BUILD" --dart-define=VERSION="$VER" --target-platform android-arm64,android-arm
+
+      - name: Pasirašyti
+        run: |
+          curl -fsS -H "X-Release-Token: $CG_TOKEN" "$CG_URL/api/app/ci/key" -o "$RUNNER_TEMP/key.json"
+          python3 -c "import json,base64,sys;d=json.load(open(sys.argv[1]));open(sys.argv[2],'wb').write(base64.b64decode(d['jks']));open(sys.argv[3],'w').write(d['pass'])" "$RUNNER_TEMP/key.json" "$RUNNER_TEMP/release.jks" "$RUNNER_TEMP/release.pass"
+          rm -f "$RUNNER_TEMP/key.json"
+          AS="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -n1)apksigner"
+          "$AS" sign --ks "$RUNNER_TEMP/release.jks" --ks-key-alias cg --ks-pass file:"$RUNNER_TEMP/release.pass" --key-pass file:"$RUNNER_TEMP/release.pass" --out signed.apk build/app/outputs/flutter-apk/app-release.apk
+          "$AS" verify signed.apk
+          rm -f "$RUNNER_TEMP/release.jks" "$RUNNER_TEMP/release.pass"
+
+      - name: Įkelti į CloudGames
+        run: |
+          curl -fsS --retry 3 -X POST -H "X-Release-Token: $CG_TOKEN" -H "X-Version: $VER" -H "X-Build: $BUILD" -H "Content-Type: application/vnd.android.package-archive" --data-binary @signed.apk "$CG_URL/api/app/ci/release"
+          echo
+          echo "Paruošta: $VER ($BUILD). Atsisiųsk: Valdymas → CGIntelligent → Programėlė"
